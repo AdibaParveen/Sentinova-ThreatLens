@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.models import Alert, AlertRule, Indicator, SecurityEvent
+from app.notify import notify_users
 from app.realtime import publish
 from app.scoring import severity_label
 
@@ -56,6 +57,15 @@ def maybe_raise_alert(db: Session, indicator: Indicator, events: list[SecurityEv
     db.add(alert)
     db.flush()
     publish("alerts.stream", {"id": str(alert.id), "title": alert.title, "severity": alert.severity, "status": alert.status})
+    ntype = "critical_alert" if label == "critical" else ("high_severity" if label == "high" else "system")
+    notify_users(
+        db,
+        ntype=ntype,
+        title=alert.title,
+        body="A new correlated alert is waiting in the SOC queue.",
+        link="/soc",
+        permission="alerts.read",
+    )
     if indicator.severity_score >= 75:
         publish("indicators.high_severity", {"id": str(indicator.id), "value": indicator.value, "score": indicator.severity_score})
     return alert

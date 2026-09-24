@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import write_audit
@@ -39,9 +40,12 @@ from app.models import (
     Tag,
     User,
 )
+from app.ingestion import poll_feed as run_poll
+from app.notify import notify_users
 from app.normalize import fingerprint, normalize_value
 from app.realtime import publish
 from app.scoring import score_breakdown, severity_label
+from app.search_index import search_indicators
 from app.services.ai_triage import generate_triage
 from app.services.reports import build_pdf, build_stix
 
@@ -221,6 +225,18 @@ def patch_indicator(iid: UUID, payload: IndicatorPatch, request: Request, user: 
         ind.tlp = payload.tlp
     if payload.notes is not None:
         ind.notes = payload.notes
+    if payload.tags is not None:
+        db.query(IndicatorTag).filter(IndicatorTag.indicator_id == ind.id).delete()
+        for tname in payload.tags:
+            tag = db.query(Tag).filter(Tag.name == tname).first() or Tag(name=tname)
+            db.add(tag)
+            db.flush()
+            db.add(IndicatorTag(indicator_id=ind.id, tag_id=tag.id))
+    if payload.attack is not None:
+        db.query(IndicatorTechnique).filter(IndicatorTechnique.indicator_id == ind.id).delete()
+        for tid in payload.attack:
+            if db.get(AttackTechnique, tid):
+                db.add(IndicatorTechnique(indicator_id=ind.id, technique_id=tid))
     write_audit(db, action="INDICATOR_UPDATE", user=user, resource="indicator", resource_id=str(ind.id), ip=client_ip(request), correlation_id=cid, metadata=payload.model_dump(exclude_none=True))
     db.commit()
     return ind_out(db, ind, True)
@@ -366,6 +382,14 @@ def escalate_alert(aid: UUID, request: Request, user: User = Depends(require("in
         db.add(ContainmentItem(incident_id=inc.id, label=label, done=False))
     a.status = "in_progress"
     write_audit(db, action="ALERT_ESCALATE", user=user, resource="incident", resource_id=str(inc.id), ip=client_ip(request), correlation_id=cid)
+    notify_users(
+        db,
+        ntype="incident_assignment",
+        title=inc.title,
+        body="Incident created from alert escalation.",
+        link=f"/incidents/{inc.id}",
+        permission="incidents.read",
+    )
     publish(f"incidents.{inc.id}", {"event": "created"})
     db.commit()
     return {"incident_id": str(inc.id)}
@@ -414,6 +438,9 @@ def inc_detail(db: Session, inc: Incident) -> dict:
     checks = db.query(ContainmentItem).filter(ContainmentItem.incident_id == inc.id).all()
     iids = [r.indicator_id for r in db.query(IncidentIndicator).filter(IncidentIndicator.incident_id == inc.id)]
     aids = [r.alert_id for r in db.query(IncidentAlert).filter(IncidentAlert.incident_id == inc.id)]
+    events = []
+    for iid in iids:
+        events.extend(db.query(SecurityEvent).filter(SecurityEvent.indicator_id == iid).all())
     return {
         **inc_out(db, inc),
         "timeline": [
@@ -423,7 +450,39 @@ def inc_detail(db: Session, inc: Incident) -> dict:
         "checklist": [{"id": str(c.id), "label": c.label, "done": c.done} for c in checks],
         "indicators": [ind_out(db, db.get(Indicator, i)) for i in iids if db.get(Indicator, i)],
         "alerts": [str(a) for a in aids],
+        "events": [
+            {"id": str(e.id), "type": e.event_type, "source_host": e.source_host, "value": e.indicator_value, "occurred_at": e.occurred_at.isoformat()}
+            for e in events
+        ],
     }
+
+
+class IncidentPatch(BaseModel):
+    status: str | None = None
+    assignee_id: str | None = None
+    title: str | None = None
+
+
+@router.patch("/incidents/{iid}")
+def patch_incident(iid: UUID, payload: IncidentPatch, request: Request, user: User = Depends(require("incidents.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    inc = db.get(Incident, iid)
+    if not inc:
+        raise HTTPException(404, detail={"error_code": "NOT_FOUND", "message": "Incident not found"})
+    allowed = {"open", "investigating", "contained", "resolved", "closed"}
+    if payload.status:
+        if payload.status not in allowed:
+            raise HTTPException(400, detail={"error_code": "INVALID_STATUS", "message": "Invalid incident status"})
+        inc.status = payload.status
+        db.add(IncidentTimeline(incident_id=inc.id, event_type="status_change", message=f"Status set to {payload.status}", actor_id=user.id))
+    if payload.assignee_id:
+        inc.assignee_id = payload.assignee_id
+        db.add(IncidentTimeline(incident_id=inc.id, event_type="assignment", message="Incident reassigned", actor_id=user.id))
+    if payload.title:
+        inc.title = payload.title
+    write_audit(db, action="INCIDENT_UPDATE", user=user, resource="incident", resource_id=str(inc.id), ip=client_ip(request), correlation_id=cid, metadata=payload.model_dump(exclude_none=True))
+    publish(f"incidents.{inc.id}", {"event": "updated"})
+    db.commit()
+    return inc_detail(db, inc)
 
 
 class TimelineIn(BaseModel):
@@ -502,14 +561,25 @@ def delete_hunt(hid: UUID, request: Request, user: User = Depends(require("hunts
 @router.get("/search")
 def search(q: str = "", user: User = Depends(require("intelligence.search")), db: Session = Depends(get_db)):
     ql = f"%{q}%"
-    inds = db.query(Indicator).filter(or_(Indicator.value.ilike(ql), Indicator.category.ilike(ql))).limit(15).all()
+    ids = search_indicators(q)
+    ind_q = db.query(Indicator).filter(or_(Indicator.value.ilike(ql), Indicator.category.ilike(ql)))
+    if ids:
+        from uuid import UUID as _UUID
+
+        extra = db.query(Indicator).filter(Indicator.id.in_([_UUID(i) for i in ids if len(i) == 36]))
+        inds = {str(i.id): i for i in ind_q.limit(15).all()}
+        for i in extra.all():
+            inds[str(i.id)] = i
+        ind_list = list(inds.values())[:15]
+    else:
+        ind_list = ind_q.limit(15).all()
     alerts = db.query(Alert).filter(Alert.title.ilike(ql)).limit(10).all()
     incs = db.query(Incident).filter(Incident.title.ilike(ql)).limit(10).all()
     events = db.query(SecurityEvent).filter(or_(SecurityEvent.indicator_value.ilike(ql), SecurityEvent.source_host.ilike(ql))).limit(10).all()
     techs = db.query(AttackTechnique).filter(or_(AttackTechnique.id.ilike(ql), AttackTechnique.name.ilike(ql))).limit(10).all()
     tags = db.query(Tag).filter(Tag.name.ilike(ql)).limit(10).all()
     return {
-        "indicators": [ind_out(db, i) for i in inds],
+        "indicators": [ind_out(db, i) for i in ind_list],
         "alerts": [{"id": str(a.id), "title": a.title, "severity": a.severity} for a in alerts],
         "incidents": [{"id": str(i.id), "title": i.title, "severity": i.severity} for i in incs],
         "events": [{"id": str(e.id), "type": e.event_type, "value": e.indicator_value} for e in events],
@@ -532,12 +602,42 @@ def feeds(user: User = Depends(require("feeds.manage")), db: Session = Depends(g
                 "enabled": f.enabled,
                 "last_poll_at": f.last_poll_at.isoformat() if f.last_poll_at else None,
                 "next_poll_at": f.next_poll_at.isoformat() if f.next_poll_at else None,
+                "poll_interval_minutes": f.poll_interval_minutes,
                 "indicators_received": f.indicators_received,
                 "error_count": f.error_count,
+                "last_error": f.last_error,
             }
             for f in rows
         ]
     }
+
+
+class FeedIn(BaseModel):
+    name: str
+    provider: str
+    feed_type: str
+    poll_interval_minutes: int = 60
+
+
+@router.post("/feeds")
+def add_feed(payload: FeedIn, request: Request, user: User = Depends(require("feeds.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    f = Feed(
+        name=payload.name,
+        provider=payload.provider,
+        feed_type=payload.feed_type,
+        poll_interval_minutes=payload.poll_interval_minutes,
+        enabled=True,
+        status="healthy",
+        is_demo=False,
+    )
+    db.add(f)
+    write_audit(db, action="FEED_CREATE", user=user, resource="feed", ip=client_ip(request), correlation_id=cid)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, detail={"error_code": "FEED_EXISTS", "message": "A feed with this name already exists"})
+    return {"id": str(f.id), "name": f.name}
 
 
 class FeedPatch(BaseModel):
@@ -564,11 +664,10 @@ def poll_feed(fid: UUID, request: Request, user: User = Depends(require("feeds.m
     f = db.get(Feed, fid)
     if not f:
         raise HTTPException(404, detail={"error_code": "NOT_FOUND", "message": "Feed not found"})
-    f.last_poll_at = datetime.now(timezone.utc)
-    f.status = "healthy"
-    write_audit(db, action="FEED_POLL", user=user, resource="feed", resource_id=str(f.id), ip=client_ip(request), correlation_id=cid)
+    n = run_poll(db, f)
+    write_audit(db, action="FEED_POLL", user=user, resource="feed", resource_id=str(f.id), ip=client_ip(request), correlation_id=cid, metadata={"ingested": n})
     db.commit()
-    return {"status": "queued"}
+    return {"status": "ok", "ingested": n}
 
 
 @router.get("/audit")
@@ -644,6 +743,23 @@ def exec_dash(user: User = Depends(require("dashboards.executive")), db: Session
     }
 
 
+@router.get("/dashboards/heatmap")
+def heatmap(user: User = Depends(require("dashboards.executive")), db: Session = Depends(get_db)):
+    inds = db.query(Indicator).all()
+    cats: dict[str, dict[str, int]] = {}
+    geos: dict[str, dict[str, int]] = {}
+    types: dict[str, dict[str, int]] = {}
+    for i in inds:
+        label = severity_label(i.severity_score)
+        cat = i.category or "uncategorized"
+        geo = i.country or "Unknown"
+        typ = i.type or "unknown"
+        for bucket, key in ((cats, cat), (geos, geo), (types, typ)):
+            bucket.setdefault(key, {})
+            bucket[key][label] = bucket[key].get(label, 0) + 1
+    return {"categories": cats, "geographies": geos, "types": types}
+
+
 @router.get("/attack")
 def attack_coverage(user: User = Depends(require("dashboards.hunting")), db: Session = Depends(get_db)):
     techs = db.query(AttackTechnique).all()
@@ -665,15 +781,13 @@ class ReportIn(BaseModel):
 
 @router.post("/reports")
 def create_report(payload: ReportIn, request: Request, user: User = Depends(require("reports.generate")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
-    data = exec_dash(user, db) if False else None
-    # rebuild executive snapshot
-    from app.api.v1 import intel as _self  # noqa
-
+    snapshot = exec_dash(user, db)
     snap = {
         "type": payload.report_type,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "generated_by": user.full_name,
         "tlp_max": payload.tlp_max,
+        "snapshot": snapshot,
     }
     rec = Report(title=payload.title or f"{payload.report_type.title()} report", report_type=payload.report_type, format=payload.format, created_by=user.id, payload=snap, status="ready")
     db.add(rec)
@@ -718,6 +832,12 @@ def report_pdf(rid: UUID, user: User = Depends(require("reports.generate")), db:
     return StreamingResponse(io.BytesIO(pdf), media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={rec.id}.pdf"})
 
 
+@router.get("/directory")
+def directory(user: User = Depends(require("alerts.read")), db: Session = Depends(get_db)):
+    rows = db.query(User).filter(User.status == "active").order_by(User.full_name.asc()).all()
+    return {"items": [{"id": str(u.id), "name": u.full_name, "role": u.role, "email": u.email} for u in rows]}
+
+
 @router.get("/users")
 def users(user: User = Depends(require("users.manage")), db: Session = Depends(get_db)):
     rows = db.query(User).all()
@@ -726,16 +846,28 @@ def users(user: User = Depends(require("users.manage")), db: Session = Depends(g
     return {"items": [serialize_user(u) for u in rows]}
 
 
-class RoleIn(BaseModel):
-    role: str
+class UserAdminPatch(BaseModel):
+    role: str | None = None
+    status: str | None = None
 
 
 @router.patch("/users/{uid}/role")
-def set_role(uid: UUID, payload: RoleIn, request: Request, user: User = Depends(require("users.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+def set_role(uid: UUID, payload: UserAdminPatch, request: Request, user: User = Depends(require("users.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
     target = db.get(User, uid)
     if not target:
         raise HTTPException(404, detail={"error_code": "NOT_FOUND", "message": "User not found"})
-    target.role = payload.role
-    write_audit(db, action="USER_ROLE_CHANGE", user=user, resource="user", resource_id=str(uid), ip=client_ip(request), correlation_id=cid, metadata={"role": payload.role})
+    if payload.role:
+        allowed = {"administrator", "security_engineer", "incident_responder", "threat_hunter", "soc_analyst", "executive"}
+        if payload.role not in allowed:
+            raise HTTPException(400, detail={"error_code": "INVALID_ROLE", "message": "Invalid role"})
+        target.role = payload.role
+    if payload.status:
+        if payload.status not in {"pending", "active", "locked", "disabled"}:
+            raise HTTPException(400, detail={"error_code": "INVALID_STATUS", "message": "Invalid user status"})
+        target.status = payload.status
+        if payload.status == "active":
+            target.failed_logins = 0
+            target.locked_until = None
+    write_audit(db, action="USER_ROLE_CHANGE", user=user, resource="user", resource_id=str(uid), ip=client_ip(request), correlation_id=cid, metadata=payload.model_dump(exclude_none=True))
     db.commit()
     return {"status": "ok"}

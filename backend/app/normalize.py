@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import hashlib
 import ipaddress
 import re
@@ -45,7 +46,12 @@ def detect_type(value: str) -> str | None:
 
 def normalize_value(value: str, ioc_type: str | None = None) -> tuple[str, str]:
     raw = value.strip()
-    detected = ioc_type or detect_type(raw)
+
+# DNS fully-qualified domain names may end with a trailing dot.
+# Remove it before IOC type detection.
+    detection_value = raw.rstrip(".")
+
+    detected = ioc_type or detect_type(detection_value)
     if not detected:
         raise ValueError("Unable to determine indicator type")
     if detected == "ip":

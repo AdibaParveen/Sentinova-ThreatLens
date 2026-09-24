@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Lint (compile)
+        run: python -m compileall app tests
+      - name: Unit tests
+        run: pytest -q
+      - name: Dependency scan
+        run: pip install pip-audit && pip-audit -r requirements.txt || true
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci || npm install
+      - run: npx tsc --noEmit
+      - run: npm run lint --if-present
+      - run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API image
+        run: docker build -t threatlens-api ./backend
+      - name: Build web image
+        run: docker build -t threatlens-web ./frontend
+      - name: Container scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: threatlens-api
+          format: table
+          exit-code: "0"
+          severity: CRITICAL,HIGH

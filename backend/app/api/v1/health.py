@@ -5,8 +5,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db import get_db, engine
-from app.deps import require
+from app.db import get_db
+from app.deps import current_user, require
 from app.models import Feed, User
 
 router = APIRouter(tags=["health"])
@@ -61,3 +61,22 @@ def health_detailed(user: User = Depends(require("health.view")), db: Session = 
     base["worker"] = "ok"
     base["scheduler"] = "ok"
     return base
+
+
+@router.get("/about")
+def about(user: User = Depends(current_user)):
+    return {
+        "product": "ThreatLens",
+        "version": settings.threatlens_version,
+        "api_version": "v1",
+        "environment": settings.app_env,
+        "docs": "/api/docs",
+        "security": [
+            "Server-side RBAC",
+            "JWT access and refresh tokens",
+            "Password hashing (bcrypt)",
+            "Optional TOTP MFA",
+            "Append-only audit log",
+            "Rate limiting and account lockout",
+        ],
+    }

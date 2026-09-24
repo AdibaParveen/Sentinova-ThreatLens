@@ -127,13 +127,17 @@ NAV_ITEMS = [
     {"id": "indicators", "label": "Indicators", "href": "/indicators", "perm": "indicators.read"},
     {"id": "alerts", "label": "Alerts", "href": "/alerts", "perm": "alerts.read"},
     {"id": "intel", "label": "Threat Intelligence", "href": "/intel", "perm": "indicators.read"},
+    {"id": "attack", "label": "ATT&CK", "href": "/attack", "perm": "dashboards.hunting"},
+    {"id": "graph", "label": "Relationships", "href": "/graph", "perm": "dashboards.hunting"},
+    {"id": "heatmap", "label": "Heatmap", "href": "/heatmap", "perm": "dashboards.executive"},
     {"id": "map", "label": "Threat Map", "href": "/map", "perm": "dashboards.view"},
     {"id": "reports", "label": "Reports", "href": "/reports", "perm": "reports.generate"},
     {"id": "integrations", "label": "Integrations", "href": "/integrations", "perm": "integrations.manage"},
-    {"id": "feeds", "label": "Feeds", "href": "feeds", "perm": "feeds.manage"},
+    {"id": "feeds", "label": "Feeds", "href": "/feeds", "perm": "feeds.manage"},
     {"id": "audit", "label": "Audit Logs", "href": "/audit", "perm": "audit.view"},
+    {"id": "users", "label": "Users", "href": "/users", "perm": "users.manage"},
     {"id": "health", "label": "System Health", "href": "/health", "perm": "health.view"},
-    {"id": "settings", "label": "Settings", "href": "/settings/profile", "perm": "dashboards.view"},
+    {"id": "settings", "label": "Settings", "href": "/settings", "perm": "dashboards.view"},
 ]
 
 
@@ -147,9 +151,6 @@ def has_permission(role: str, permission: str) -> bool:
 def navigation_for(role: str) -> list[dict]:
     items = []
     for item in NAV_ITEMS:
-        href = item["href"]
-        if href == "feeds":
-            href = "/feeds"
         if has_permission(role, item["perm"]):
-            items.append({**item, "href": href})
+            items.append(dict(item))
     return items

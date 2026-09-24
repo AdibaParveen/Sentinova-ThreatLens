@@ -72,6 +72,12 @@ def build_pdf(report: Report, db: Session) -> bytes:
     c.drawString(40, y, "Executive summary")
     y -= 16
     c.setFont("Helvetica", 10)
+    snap = (report.payload or {}).get("snapshot") or {}
+    if snap:
+        c.drawString(40, y, f"Organizational risk {snap.get('risk_score', 'n/a')}/100 · Critical IOCs {snap.get('critical_indicators', 0)} · High IOCs {snap.get('high_indicators', 0)}")
+        y -= 14
+        c.drawString(40, y, f"Active incidents {snap.get('active_incidents', 0)} · Open alerts {snap.get('open_alerts', 0)} · TLP max {(report.payload or {}).get('tlp_max', 'red')}")
+        y -= 18
     inds = db.query(Indicator).order_by(Indicator.severity_score.desc()).limit(12).all()
     c.drawString(40, y, f"Key findings: {len(inds)} highlighted indicators. Scores are engine-computed, not hard-coded.")
     y -= 22

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr
@@ -8,11 +10,15 @@ from sqlalchemy.orm import Session
 
 from app.audit import write_audit
 from app.api.v1.auth import serialize_user
+from app.config import get_settings
 from app.db import get_db
 from app.deps import client_ip, correlation_id, current_user, require
-from app.models import ApiKey, AuditLog, Notification, User, UserPreference, UserSession, Webhook
+from app.emailer import verification_email
+from app.models import ApiKey, AuditLog, EmailToken, Notification, User, UserPreference, UserSession, Webhook
 from app.rbac import navigation_for
 from app.security import hash_password, hash_token, password_errors, random_token, verify_password
+
+settings = get_settings()
 
 router = APIRouter(tags=["me"])
 
@@ -176,6 +182,51 @@ def read_note(nid: str, user: User = Depends(current_user), db: Session = Depend
     return {"status": "ok"}
 
 
+@router.post("/notifications/read-all")
+def read_all(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    db.query(Notification).filter(Notification.user_id == user.id, Notification.read.is_(False)).update({"read": True})
+    db.commit()
+    return {"status": "ok"}
+
+
+class EmailChangeIn(BaseModel):
+    email: EmailStr
+
+
+@router.post("/me/email")
+def change_email(payload: EmailChangeIn, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    new_email = payload.email.lower()
+    if db.query(User).filter(User.email == new_email, User.id != user.id).first():
+        raise HTTPException(409, detail={"error_code": "EMAIL_EXISTS", "message": "An account with this email already exists"})
+    raw = random_token()
+    db.add(
+        EmailToken(
+            user_id=user.id,
+            token_hash=hash_token(raw),
+            purpose="email_change",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+            extra={"new_email": new_email},
+        )
+    )
+    write_audit(db, action="EMAIL_CHANGE_REQUEST", user=user, resource="user", resource_id=str(user.id), ip=client_ip(request), correlation_id=cid)
+    db.commit()
+    try:
+        verification_email(new_email, user.full_name, f"{settings.app_url}/verify-email?token={raw}&purpose=email_change")
+    except Exception:
+        pass
+    return {"status": "verification_sent", "message": "Confirm the new address from the verification email."}
+
+
+@router.post("/sessions/{sid}/revoke")
+def revoke_one(sid: str, request: Request, user: User = Depends(current_user), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    sess = db.get(UserSession, sid)
+    if sess and sess.user_id == user.id:
+        sess.revoked_at = datetime.now(timezone.utc)
+        write_audit(db, action="SESSION_REVOKE", user=user, resource="session", resource_id=sid, ip=client_ip(request), correlation_id=cid)
+        db.commit()
+    return {"status": "ok"}
+
+
 @router.post("/api-keys")
 def create_key(request: Request, user: User = Depends(require("integrations.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
     raw = "tl_" + random_token(24)
@@ -190,6 +241,59 @@ def create_key(request: Request, user: User = Depends(require("integrations.mana
 def list_keys(user: User = Depends(require("integrations.manage")), db: Session = Depends(get_db)):
     rows = db.query(ApiKey).filter(ApiKey.user_id == user.id).all()
     return [{"id": str(k.id), "name": k.name, "prefix": k.prefix, "created_at": k.created_at.isoformat(), "revoked": bool(k.revoked_at)} for k in rows]
+
+
+@router.post("/api-keys/{kid}/revoke")
+def revoke_key(kid: str, request: Request, user: User = Depends(require("integrations.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    rec = db.get(ApiKey, kid)
+    if rec and rec.user_id == user.id:
+        rec.revoked_at = datetime.now(timezone.utc)
+        write_audit(db, action="API_KEY_REVOKE", user=user, resource="api_key", resource_id=kid, ip=client_ip(request), correlation_id=cid)
+        db.commit()
+    return {"status": "ok"}
+
+
+class WebhookIn(BaseModel):
+    name: str
+    url: str
+    events: list[str] = ["alerts.stream"]
+
+
+@router.get("/webhooks")
+def list_hooks(user: User = Depends(require("integrations.manage")), db: Session = Depends(get_db)):
+    rows = db.query(Webhook).all()
+    return [{"id": str(w.id), "name": w.name, "url": w.url, "events": w.events, "enabled": w.enabled, "secret_prefix": w.secret_prefix} for w in rows]
+
+
+@router.post("/webhooks")
+def create_hook(payload: WebhookIn, request: Request, user: User = Depends(require("integrations.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    if not payload.url.startswith(("https://", "http://localhost", "http://127.0.0.1")):
+        raise HTTPException(400, detail={"error_code": "SSRF_BLOCKED", "message": "Webhook URL must be HTTPS or local development"})
+    secret = random_token(16)
+    rec = Webhook(name=payload.name, url=payload.url, events=payload.events, created_by=user.id, secret_prefix=secret[:8])
+    db.add(rec)
+    write_audit(db, action="WEBHOOK_CREATE", user=user, resource="webhook", ip=client_ip(request), correlation_id=cid)
+    db.commit()
+    return {"id": str(rec.id), "secret": secret, "warning": "This secret is shown once"}
+
+
+class WebhookPatch(BaseModel):
+    enabled: bool | None = None
+    events: list[str] | None = None
+
+
+@router.patch("/webhooks/{wid}")
+def patch_hook(wid: UUID, payload: WebhookPatch, request: Request, user: User = Depends(require("integrations.manage")), db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+    rec = db.get(Webhook, wid)
+    if not rec:
+        raise HTTPException(404, detail={"error_code": "NOT_FOUND", "message": "Webhook not found"})
+    if payload.enabled is not None:
+        rec.enabled = payload.enabled
+    if payload.events is not None:
+        rec.events = payload.events
+    write_audit(db, action="WEBHOOK_UPDATE", user=user, resource="webhook", resource_id=str(wid), ip=client_ip(request), correlation_id=cid)
+    db.commit()
+    return {"id": str(rec.id), "enabled": rec.enabled}
 
 
 def _audit(r: AuditLog) -> dict:

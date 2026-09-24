@@ -1,8 +1,8 @@
-from __future__ import annotations
+
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,7 @@ from app.db import get_db
 from app.deps import client_ip, correlation_id, current_user
 from app.emailer import reset_email, verification_email
 from app.models import EmailToken, User, UserPreference, UserSession
+from app.rate_limit import limiter
 from app.rbac import PRIVILEGED_ROLES, navigation_for
 from app.security import (
     PASSWORD_RULES,
@@ -43,11 +44,10 @@ class RegisterIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     remember_me: bool = False
     totp: str | None = None
-
 
 class ResetRequest(BaseModel):
     email: EmailStr
@@ -76,6 +76,7 @@ def password_rules():
 
 
 @router.post("/register")
+@limiter.limit("5/minute")
 def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
     if payload.password != payload.confirm_password:
         raise HTTPException(400, detail={"error_code": "PASSWORD_MISMATCH", "message": "Passwords do not match"})
@@ -124,7 +125,7 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
 
 @router.post("/verify-email")
 def verify_email(token: str, request: Request, db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
-    rec = db.query(EmailToken).filter(EmailToken.token_hash == hash_token(token), EmailToken.purpose == "verify").first()
+    rec = db.query(EmailToken).filter(EmailToken.token_hash == hash_token(token)).first()
     if not rec:
         raise HTTPException(400, detail={"error_code": "INVALID_TOKEN", "message": "Verification link is invalid"})
     if rec.used_at:
@@ -132,6 +133,17 @@ def verify_email(token: str, request: Request, db: Session = Depends(get_db), ci
     if rec.expires_at < datetime.now(timezone.utc):
         raise HTTPException(400, detail={"error_code": "EXPIRED", "message": "Verification link expired"})
     user = db.get(User, rec.user_id)
+    if rec.purpose == "email_change":
+        new_email = (rec.extra or {}).get("new_email")
+        if new_email:
+            user.email = new_email
+            user.email_verified = True
+        rec.used_at = datetime.now(timezone.utc)
+        write_audit(db, action="EMAIL_CHANGED", user=user, resource="user", resource_id=str(user.id), ip=client_ip(request), correlation_id=cid)
+        db.commit()
+        return {"status": "verified"}
+    if rec.purpose != "verify":
+        raise HTTPException(400, detail={"error_code": "INVALID_TOKEN", "message": "Verification link is invalid"})
     user.email_verified = True
     user.status = "active"
     rec.used_at = datetime.now(timezone.utc)
@@ -156,7 +168,13 @@ def resend(payload: ResetRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/login")
-def login(payload: LoginIn, request: Request, db: Session = Depends(get_db), cid: str = Depends(correlation_id)):
+@limiter.limit("8/minute")
+def login(
+    payload: LoginIn = Body(...),
+    request: Request = None,
+    db: Session = Depends(get_db),
+    cid: str = Depends(correlation_id),
+):
     user = db.query(User).filter(User.email == payload.email.lower()).first()
     ip = client_ip(request)
     if not user:
@@ -242,7 +260,8 @@ def logout(payload: RefreshIn, request: Request, db: Session = Depends(get_db), 
 
 
 @router.post("/forgot-password")
-def forgot(payload: ResetRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def forgot(payload: ResetRequest, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email.lower()).first()
     if user:
         raw = random_token()
